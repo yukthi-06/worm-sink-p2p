@@ -1,0 +1,1 @@
+gradlew :wormsink-cli:fatJar

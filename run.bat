@@ -1,3 +1,6 @@
-call SP
-java -jar target/dlna-server.jar --host 192.168.1.68 --media-dir D:\1-Movies\crit\1\
-
+@echo off
+setlocal
+set "LIB_DIR=%~dp0wormsink-cli\build\install\wormsink-cli\lib"
+set "CLASSPATH=%LIB_DIR%\*"
+java -cp "%CLASSPATH%" org.wormsink.cli.WormSinkCli %*
+endlocal

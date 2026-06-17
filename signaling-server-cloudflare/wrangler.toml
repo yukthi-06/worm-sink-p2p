@@ -1,0 +1,11 @@
+name = "wormsinks"
+main = "index.js"
+compatibility_date = "2023-05-18"
+
+# KV Namespace Bindings
+# To deploy to production with KV persistence, run:
+#   npx wrangler kv:namespace create SESSIONS
+# Then paste the output ID below:
+# [[kv_namespaces]]
+# binding = "SESSIONS"
+# id = "PASTE_YOUR_KV_NAMESPACE_ID_HERE"
