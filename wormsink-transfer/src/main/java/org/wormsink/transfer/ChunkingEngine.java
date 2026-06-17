@@ -7,7 +7,7 @@ import java.nio.channels.FileChannel;
 import java.security.MessageDigest;
 
 public class ChunkingEngine {
-    public static final int DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024; // 4MB
+    public static final int DEFAULT_CHUNK_SIZE = 64 * 1024; // 64KB — must stay below WebRTC SCTP 256KB message limit
 
     public static byte[] calculateSha256(byte[] data) {
         try {

@@ -1,6 +1,8 @@
 package org.wormsink.webrtc;
 
 import dev.onvoid.webrtc.*;
+import dev.onvoid.webrtc.media.audio.AudioDeviceModule;
+import dev.onvoid.webrtc.media.audio.AudioLayer;
 import org.wormsink.signaling.SignalingClient;
 import org.wormsink.signaling.SessionState;
 
@@ -18,6 +20,7 @@ public class PeerConnectionManager implements PeerConnectionObserver {
     private final WebRtcListener listener;
 
     private PeerConnectionFactory factory;
+    private AudioDeviceModule audioDeviceModule;
     private RTCPeerConnection peerConnection;
     private RTCDataChannel dataChannel;
     
@@ -26,6 +29,7 @@ public class PeerConnectionManager implements PeerConnectionObserver {
     private final List<RTCIceCandidate> localCandidates = Collections.synchronizedList(new ArrayList<>());
     private int polledCandidateIndex = 0;
     private boolean isClosed = false;
+    private volatile boolean isRemoteDescriptionSet = false;
 
     public PeerConnectionManager(String signalingUrl, String sessionCode, boolean isSender, WebRtcListener listener) {
         this.signalingUrl = signalingUrl;
@@ -36,8 +40,9 @@ public class PeerConnectionManager implements PeerConnectionObserver {
     }
 
     public void start() throws Exception {
-        // Initialize Native WebRTC library
-        this.factory = new PeerConnectionFactory();
+        // Initialize Native WebRTC library with dummy audio
+        this.audioDeviceModule = new AudioDeviceModule(AudioLayer.kDummyAudio);
+        this.factory = new PeerConnectionFactory(this.audioDeviceModule);
         
         RTCConfiguration config = new RTCConfiguration();
         RTCIceServer stun1 = new RTCIceServer();
@@ -78,13 +83,15 @@ public class PeerConnectionManager implements PeerConnectionObserver {
                 peerConnection.setLocalDescription(desc, new SetSessionDescriptionObserver() {
                     @Override
                     public void onSuccess() {
-                        try {
-                            signalingClient.sendOffer(sessionCode, desc.sdp);
-                            // Now start polling for Answer
-                            pollForAnswer();
-                        } catch (Exception e) {
-                            listener.onConnectionStateChange("FAILED: " + e.getMessage());
-                        }
+                        CompletableFuture.runAsync(() -> {
+                            try {
+                                signalingClient.sendOffer(sessionCode, desc.sdp);
+                                // Now start polling for Answer
+                                pollForAnswer();
+                            } catch (Exception e) {
+                                listener.onConnectionStateChange("FAILED: " + e.getMessage());
+                            }
+                        });
                     }
 
                     @Override
@@ -129,6 +136,7 @@ public class PeerConnectionManager implements PeerConnectionObserver {
         peerConnection.setRemoteDescription(remoteDesc, new SetSessionDescriptionObserver() {
             @Override
             public void onSuccess() {
+                isRemoteDescriptionSet = true;
                 RTCAnswerOptions options = new RTCAnswerOptions();
                 peerConnection.createAnswer(options, new CreateSessionDescriptionObserver() {
                     @Override
@@ -136,11 +144,13 @@ public class PeerConnectionManager implements PeerConnectionObserver {
                         peerConnection.setLocalDescription(localDesc, new SetSessionDescriptionObserver() {
                             @Override
                             public void onSuccess() {
-                                try {
-                                    signalingClient.sendAnswer(sessionCode, localDesc.sdp);
-                                } catch (Exception e) {
-                                    listener.onConnectionStateChange("FAILED to send answer: " + e.getMessage());
-                                }
+                                CompletableFuture.runAsync(() -> {
+                                    try {
+                                        signalingClient.sendAnswer(sessionCode, localDesc.sdp);
+                                    } catch (Exception e) {
+                                        listener.onConnectionStateChange("FAILED to send answer: " + e.getMessage());
+                                    }
+                                });
                             }
 
                             @Override
@@ -179,6 +189,7 @@ public class PeerConnectionManager implements PeerConnectionObserver {
                     peerConnection.setRemoteDescription(remoteDesc, new SetSessionDescriptionObserver() {
                         @Override
                         public void onSuccess() {
+                            isRemoteDescriptionSet = true;
                             // Remote description set successfully
                         }
 
@@ -200,6 +211,7 @@ public class PeerConnectionManager implements PeerConnectionObserver {
     private void startIceCandidatePolling() {
         scheduler.scheduleWithFixedDelay(() -> {
             if (isClosed) return;
+            if (!isRemoteDescriptionSet) return;
             try {
                 SessionState session = signalingClient.getSession(sessionCode);
                 if (session != null && session.candidates != null) {
@@ -275,6 +287,11 @@ public class PeerConnectionManager implements PeerConnectionObserver {
                 factory.dispose();
             } catch (Exception e) {}
         }
+        if (audioDeviceModule != null) {
+            try {
+                audioDeviceModule.dispose();
+            } catch (Exception e) {}
+        }
     }
 
     // --- PeerConnectionObserver Interface Callbacks ---
@@ -298,12 +315,14 @@ public class PeerConnectionManager implements PeerConnectionObserver {
 
     @Override
     public void onIceCandidate(RTCIceCandidate candidate) {
-        try {
-            signalingClient.sendCandidate(sessionCode, candidate.sdp, candidate.sdpMid, candidate.sdpMLineIndex);
-        } catch (Exception e) {
-            // Queue and retry
-            localCandidates.add(candidate);
-        }
+        CompletableFuture.runAsync(() -> {
+            try {
+                signalingClient.sendCandidate(sessionCode, candidate.sdp, candidate.sdpMid, candidate.sdpMLineIndex);
+            } catch (Exception e) {
+                // Queue and retry
+                localCandidates.add(candidate);
+            }
+        });
     }
 
     @Override

@@ -7,13 +7,28 @@ import java.util.regex.Pattern;
 
 public class SimpleJson {
     public static String getField(String json, String field) {
-        Pattern pattern = Pattern.compile("\"" + field + "\"\\s*:\\s*\"([^\"]*)\"");
+        Pattern pattern = Pattern.compile("\"" + field + "\"\\s*:\\s*(?:\"([^\"]*)\"|([^,}\\s]+))");
         Matcher matcher = pattern.matcher(json);
         if (matcher.find()) {
-            return matcher.group(1).replace("\\\\", "\\").replace("\\\"", "\"");
+            String val = matcher.group(1);
+            if (val == null) {
+                val = matcher.group(2);
+            }
+            // JSON null literal → Java null
+            if ("null".equals(val)) {
+                return null;
+            }
+            if (val != null) {
+                return val.replace("\\\\", "\\")
+                          .replace("\\\"", "\"")
+                          .replace("\\r", "\r")
+                          .replace("\\n", "\n")
+                          .replace("\\t", "\t");
+            }
         }
         return null;
     }
+
 
     public static List<String> getArray(String json, String field) {
         List<String> list = new ArrayList<>();
@@ -32,6 +47,10 @@ public class SimpleJson {
 
     public static String escape(String raw) {
         if (raw == null) return "";
-        return raw.replace("\\", "\\\\").replace("\"", "\\\"");
+        return raw.replace("\\", "\\\\")
+                  .replace("\"", "\\\"")
+                  .replace("\r", "\\r")
+                  .replace("\n", "\\n")
+                  .replace("\t", "\\t");
     }
 }
