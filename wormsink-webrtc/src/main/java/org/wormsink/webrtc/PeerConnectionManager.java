@@ -25,11 +25,20 @@ public class PeerConnectionManager implements PeerConnectionObserver {
     private RTCDataChannel dataChannel;
     
     private final SignalingClient signalingClient;
-    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
+    // Use daemon threads so the JVM does not wait for scheduler threads when main() returns.
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2, r -> {
+        Thread t = new Thread(r, "wormsink-scheduler");
+        t.setDaemon(true);
+        return t;
+    });
     private final List<RTCIceCandidate> localCandidates = Collections.synchronizedList(new ArrayList<>());
     private int polledCandidateIndex = 0;
     private boolean isClosed = false;
     private volatile boolean isRemoteDescriptionSet = false;
+    // Counted down when native WebRTC delivers its final ICE/connection CLOSED callback.
+    // Used in close() to ensure native threads finish before factory.dispose() so the JVM
+    // never sees "VM attach current thread failed" at exit.
+    private final CountDownLatch nativeClosedLatch = new CountDownLatch(1);
 
     public PeerConnectionManager(String signalingUrl, String sessionCode, boolean isSender, WebRtcListener listener) {
         this.signalingUrl = signalingUrl;
@@ -273,26 +282,27 @@ public class PeerConnectionManager implements PeerConnectionObserver {
         isClosed = true;
         scheduler.shutdownNow();
         if (dataChannel != null) {
-            try {
-                dataChannel.close();
-            } catch (Exception e) {}
+            try { dataChannel.close(); } catch (Exception e) {}
         }
         if (peerConnection != null) {
-            try {
-                peerConnection.close();
-            } catch (Exception e) {}
+            try { peerConnection.close(); } catch (Exception e) {}
         }
+        // 1. Wait for the native ICE layer to reach CLOSED/FAILED before disposing.
+        //    This ensures native ICE threads have finished their last JNI callout.
+        try { nativeClosedLatch.await(3, TimeUnit.SECONDS); } catch (InterruptedException ignored) {}
+        // 2. Dispose native factory — this schedules factory-thread shutdown internally.
         if (factory != null) {
-            try {
-                factory.dispose();
-            } catch (Exception e) {}
+            try { factory.dispose(); } catch (Exception e) {}
         }
         if (audioDeviceModule != null) {
-            try {
-                audioDeviceModule.dispose();
-            } catch (Exception e) {}
+            try { audioDeviceModule.dispose(); } catch (Exception e) {}
         }
+        // 3. Post-dispose drain: factory.dispose() is asynchronous internally; factory
+        //    worker/network/signaling threads may still fire one last callback while
+        //    unwinding. Give them 400 ms to complete before the JVM can start to exit.
+        try { Thread.sleep(400); } catch (InterruptedException ignored) {}
     }
+
 
     // --- PeerConnectionObserver Interface Callbacks ---
 
@@ -302,6 +312,14 @@ public class PeerConnectionManager implements PeerConnectionObserver {
 
     @Override
     public void onIceConnectionChange(RTCIceConnectionState state) {
+        // Only release the close-gate when ICE is truly CLOSED (or hard-FAILED).
+        // Do NOT fire on DISCONNECTED — ICE may continue to CLOSED after DISCONNECTED,
+        // and firing too early would let factory.dispose() run while the CLOSED callback
+        // is still in-flight, causing "VM attach current thread failed".
+        if (state == RTCIceConnectionState.CLOSED
+                || state == RTCIceConnectionState.FAILED) {
+            nativeClosedLatch.countDown();
+        }
         listener.onConnectionStateChange("ICE: " + state.name());
     }
 
@@ -348,6 +366,11 @@ public class PeerConnectionManager implements PeerConnectionObserver {
 
     @Override
     public void onConnectionChange(RTCPeerConnectionState state) {
+        // Also count down on connection-level CLOSED/FAILED as a fallback.
+        if (state == RTCPeerConnectionState.CLOSED
+                || state == RTCPeerConnectionState.FAILED) {
+            nativeClosedLatch.countDown();
+        }
         listener.onConnectionStateChange("CONNECTION: " + state.name());
     }
 

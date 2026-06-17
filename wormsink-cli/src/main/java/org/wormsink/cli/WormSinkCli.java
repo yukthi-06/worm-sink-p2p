@@ -122,7 +122,7 @@ public class WormSinkCli {
         if (outputPath == null) {
             // Default to current directory and code name or ask user, but here we default to fileName from metadata
             // Which is handled in onTransferStarted, so we can defer file initialization there or default to code name
-            outputPath = "./" + code + ".download";
+            outputPath = ".";  // Default to current directory; TransferEngine resolves actual filename from metadata
         }
 
         System.out.println("Connecting...");
@@ -161,7 +161,12 @@ public class WormSinkCli {
                     @Override
                     public void onTransferStarted(String name, long size, String transferId) {
                         System.out.println("Downloading: " + name + " (" + formatSize(size) + ")");
-                        System.out.println("Saving to: " + targetPath);
+                        // Compute the resolved save path the same way TransferEngine does:
+                        // if targetPath is a directory, the file goes inside it with the real name.
+                        String savePath = new File(targetPath).isDirectory()
+                                ? new File(targetPath, name).getPath()
+                                : targetPath;
+                        System.out.println("Saving to: " + savePath);
                     }
 
                     @Override

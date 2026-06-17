@@ -43,6 +43,9 @@ public class TransferEngine implements WebRtcListener {
 
     private final CountDownLatch completeLatch = new CountDownLatch(1);
     private String errorMessage = null;
+    // Set to true once the transfer finishes successfully so that subsequent
+    // ICE/DataChannel CLOSED callbacks (triggered by our own close()) are ignored.
+    private volatile boolean transferCompleted = false;
 
     // Dedicated single-thread executor for all disk I/O & protocol work on the receiver side.
     // Keeps native WebRTC callback threads free (they must not block).
@@ -122,6 +125,10 @@ public class TransferEngine implements WebRtcListener {
 
     @Override
     public void onConnectionStateChange(String state) {
+        // Ignore all state changes once the transfer has completed successfully.
+        // This prevents the ICE: CLOSED callback (fired by our own close()) from
+        // overwriting a null errorMessage and making a success look like a failure.
+        if (transferCompleted) return;
         if (state.contains("FAILED") || state.contains("CLOSED")) {
             if (errorMessage == null) {
                 errorMessage = state;
@@ -155,7 +162,7 @@ public class TransferEngine implements WebRtcListener {
             }
         } else if (state == RTCDataChannelState.CLOSED) {
             connectionListener.onDisconnected();
-            if (errorMessage == null) {
+            if (!transferCompleted && errorMessage == null) {
                 errorMessage = "Data channel closed unexpectedly";
             }
             completeLatch.countDown();
@@ -219,6 +226,15 @@ public class TransferEngine implements WebRtcListener {
                     long   fileSize   = Long.parseLong(SimpleJson.getField(json, "fileSize"));
                     int totalChunks   = Integer.parseInt(SimpleJson.getField(json, "totalChunks"));
                     this.chunkSize    = Integer.parseInt(SimpleJson.getField(json, "chunkSize"));
+
+                    // Resolve actual destination path:
+                    // If the caller passed a directory (e.g. "."), use the real filename from metadata.
+                    File destFile = new File(destinationPath);
+                    if (destFile.isDirectory()) {
+                        destFile = new File(destFile, fileName);
+                        this.destinationPath = destFile.getPath();
+                        this.stateFilePath   = this.destinationPath + ".state";
+                    }
 
                     // Check for resumable state
                     this.transferState = ResumeEngine.loadState(stateFilePath);
@@ -287,6 +303,7 @@ public class TransferEngine implements WebRtcListener {
                         // Verify entire file
                         byte[] finalHash = ChunkingEngine.calculateFileSha256(new File(destinationPath));
                         if (ChunkingEngine.bytesToHex(finalHash).equals(transferState.fileHash)) {
+                            transferCompleted = true;   // mark success BEFORE countDown
                             Files.deleteIfExists(Paths.get(stateFilePath));
                             connectionManager.sendMessage(ProtocolSerializer.encodeComplete().encode());
                             completeLatch.countDown();
@@ -312,6 +329,7 @@ public class TransferEngine implements WebRtcListener {
 
             case COMPLETE:
                 if (isSender) {
+                    transferCompleted = true;   // mark success BEFORE countDown
                     completeLatch.countDown();
                 }
                 break;
