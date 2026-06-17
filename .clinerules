@@ -1,0 +1,10 @@
+# Global Markdown File Rules for TorrentShare
+
+1. Save any MD file created by the AI in the current project folder itself under a folder named 'Prompts'. If the folder does not exist, create it.
+2. The filename MUST be prefixed with the timestamp in `yyyyMMdd.hhmmss` format, followed by a short, descriptive snake_case name of the task, and end with the file type:
+   - For implementation plans, end with `_plan.md` (e.g., `20260602.130844_fix_drag_and_drop_plan.md` instead of `20260602.130844_implementation_plan.md`).
+   - For tasks, end with `_task.md` (e.g., `20260602.130844_fix_drag_and_drop_task.md` instead of `20260602.130844_task.md`).
+   - For walkthroughs, end with `_walkthrough.md` (e.g., `20260602.130844_fix_drag_and_drop_walkthrough.md` instead of `20260602.130844_walkthrough.md`).
+   - NEVER create files named generically like `yyyyMMdd.hhmmss_implementation_plan.md`, `yyyyMMdd.hhmmss_task.md`, or `yyyyMMdd.hhmmss_walkthrough.md`. ALWAYS include a descriptive snake_case tag in the filename representing the specific feature or fix.
+3. ALWAYS capture the exact user prompt at the top of any generated Markdown file under a `# User Prompt` header.
+4. An implementation plan or similar MD file should be created automatically detailing the steps and logic before or alongside any code changes made.
