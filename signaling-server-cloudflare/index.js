@@ -317,6 +317,21 @@ export default {
         return new Response("OK", { headers: corsHeaders });
       }
 
+      // Reset a session so the sender can post a fresh offer for a reconnecting receiver.
+      // Clears offer, answer, and all ICE candidates while keeping the session alive.
+      if (path === "/session/reset" && request.method === "POST") {
+        const { code } = await request.json();
+        const session = await getSessionData(env, code);
+        if (!session) {
+          return new Response("Session not found", { status: 404, headers: corsHeaders });
+        }
+        session.offer = null;
+        session.answer = null;
+        session.candidates = [];
+        await saveSessionData(env, code, session);
+        return new Response("OK", { headers: corsHeaders });
+      }
+
       const match = path.match(/^\/session\/([a-z-]+)$/);
       if (match && request.method === "GET") {
         const code = match[1];

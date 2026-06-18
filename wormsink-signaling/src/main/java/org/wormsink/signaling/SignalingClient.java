@@ -48,6 +48,22 @@ public class SignalingClient {
         }
     }
 
+    /** Clears offer, answer, and candidates so the sender can re-use the same session code
+     *  with a fresh WebRTC offer after a receiver disconnects mid-transfer. */
+    public void resetSession(String code) throws Exception {
+        String json = String.format("{\"code\":\"%s\"}", SimpleJson.escape(code));
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl + "/session/reset"))
+                .POST(HttpRequest.BodyPublishers.ofString(json))
+                .header("Content-Type", "application/json")
+                .build();
+        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() != 200) {
+            throw new RuntimeException("Failed to reset session: Status " + response.statusCode() + " - " + response.body());
+        }
+    }
+
+
     public void sendAnswer(String code, String sdp) throws Exception {
         String json = String.format("{\"code\":\"%s\",\"sdp\":\"%s\"}", 
                 SimpleJson.escape(code), SimpleJson.escape(sdp));

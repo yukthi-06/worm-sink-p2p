@@ -28,3 +28,7 @@ replay_pid*
 build/
 data/
 downloads/
+*.state
+*.mkv
+*.mp4
+*.mp3

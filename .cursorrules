@@ -1,4 +1,4 @@
-# Global Markdown File Rules for TorrentShare
+# Global Markdown File Rules
 
 1. Save any MD file created by the AI in the current project folder itself under a folder named 'Prompts'. If the folder does not exist, create it.
 2. The filename MUST be prefixed with the timestamp in `yyyyMMdd.hhmmss` format, followed by a short, descriptive snake_case name of the task, and end with the file type:
@@ -8,3 +8,45 @@
    - NEVER create files named generically like `yyyyMMdd.hhmmss_implementation_plan.md`, `yyyyMMdd.hhmmss_task.md`, or `yyyyMMdd.hhmmss_walkthrough.md`. ALWAYS include a descriptive snake_case tag in the filename representing the specific feature or fix.
 3. ALWAYS capture the exact user prompt at the top of any generated Markdown file under a `# User Prompt` header.
 4. An implementation plan or similar MD file should be created automatically detailing the steps and logic before or alongside any code changes made.
+
+# AI Planning and Reasoning Capture Rules
+5. BEFORE making any code changes, create a Markdown file in the Prompts folder containing:
+   - The exact user prompt
+   - Initial Analysis
+   - Assumptions
+   - Risks
+   - Files expected to be modified
+   - Step-by-step reasoning summary
+   - The implementation plan
+
+6. The reasoning summary MUST capture the assistant's visible planning and decision-making process presented in the conversation.
+
+7. After completing the task, append:
+   - Files actually modified
+   - Decisions made during implementation
+   - Deviations from the original plan
+   - Outstanding issues
+   - Suggested next steps
+
+8. The planning document MUST be continuously updated throughout the task rather than created only at the end.
+
+9. If the assistant produces a multi-step analysis before coding, that analysis MUST be written to the planning document before any source code changes are made.
+
+10. Maintain a task journal.
+
+For every user request:
+- Create a *_task.md file.
+- Append every significant assistant response.
+- Append all implementation plans.
+- Append all design discussions.
+- Append major user clarifications.
+
+The task journal should serve as a complete transcript of the engineering conversation.
+
+11. When a task requires substantial investigation or reasoning, capture a concise reasoning summary explaining:
+    - What was analyzed
+    - What alternatives were considered
+    - Why the chosen approach was selected
+
+12. The reasoning summary should capture visible planning and decision-making but does not need to include internal model reasoning.
+
