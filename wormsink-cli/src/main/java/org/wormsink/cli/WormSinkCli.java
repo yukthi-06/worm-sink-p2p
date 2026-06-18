@@ -44,6 +44,7 @@ public class WormSinkCli {
                 printUsage();
                 System.exit(1);
             }
+            System.exit(0);
         } catch (Exception e) {
             System.err.println("\nError: " + e.getMessage());
             e.printStackTrace();
@@ -81,7 +82,7 @@ public class WormSinkCli {
                 new ConnectionListener() {
                     @Override
                     public void onConnecting() {
-                        System.out.println("Connecting to receiver...");
+                        System.out.println("Waiting for receiver...");
                     }
 
                     @Override
@@ -104,11 +105,13 @@ public class WormSinkCli {
                     @Override
                     public void onTransferCompleted() {
                         System.out.println("\nTransfer completed successfully!");
+                        System.exit(0);
                     }
 
                     @Override
                     public void onTransferFailed(String reason) {
                         System.out.println("\nTransfer failed: " + reason);
+                        System.exit(1);
                     }
 
                     @Override
@@ -172,11 +175,13 @@ public class WormSinkCli {
                     @Override
                     public void onTransferCompleted() {
                         System.out.println("\nDownload completed successfully!");
+                        System.exit(0);
                     }
 
                     @Override
                     public void onTransferFailed(String reason) {
                         System.out.println("\nDownload failed: " + reason);
+                        System.exit(1);
                     }
 
                     @Override

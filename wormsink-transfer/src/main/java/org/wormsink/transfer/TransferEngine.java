@@ -71,6 +71,14 @@ public class TransferEngine implements WebRtcListener {
      * Counted down when the current attempt either succeeds or fails.
      */
     private volatile CountDownLatch sessionLatch = new CountDownLatch(1);
+    private volatile CountDownLatch connectionLatch = new CountDownLatch(1);
+
+    private void releaseLatches() {
+        sessionLatch.countDown();
+        if (connectionLatch != null) {
+            connectionLatch.countDown();
+        }
+    }
 
     /** Whether the OVERALL transfer (across all reconnect attempts) has completed. */
     private volatile boolean transferCompleted = false;
@@ -100,6 +108,9 @@ public class TransferEngine implements WebRtcListener {
 
     // ── Heartbeat tracking (receiver) ─────────────────────────────────────────
     private volatile long lastHeartbeatReceivedMs;
+    private volatile ScheduledFuture<?> senderHeartbeatTask;
+    private volatile ScheduledFuture<?> senderWatchdogTask;
+    private volatile ScheduledFuture<?> receiverWatchdogTask;
 
     // ── ICE DISCONNECTED grace timer (receiver) ───────────────────────────────
     /**
@@ -140,39 +151,53 @@ public class TransferEngine implements WebRtcListener {
         // Pre-compute hash once (heavy; must not run on a native WebRTC callback thread).
         this.precomputedFileHash = ChunkingEngine.bytesToHex(ChunkingEngine.calculateFileSha256(file));
 
+        // Initialize the scheduler once for the lifetime of this send operation
+        this.heartbeatScheduler = Executors.newScheduledThreadPool(2, r -> {
+            Thread t = new Thread(r, "wormsink-scheduler");
+            t.setDaemon(true);
+            return t;
+        });
+
         // ── Main send loop: retry after receiver disconnects ──────────────────
-        while (!transferCompleted) {
-            receiverDisconnected = false;
-            sessionError         = null;
-            sessionLatch         = new CountDownLatch(1);
-            requestedChunks.clear();
+        try {
+            while (!transferCompleted) {
+                receiverDisconnected = false;
+                sessionError         = null;
+                sessionLatch         = new CountDownLatch(1);
+                connectionLatch      = new CountDownLatch(1);
+                requestedChunks.clear();
 
-            connectionManager = new PeerConnectionManager(signalingUrl, sessionCode, true, this);
-            connectionManager.start();
+                connectionManager = new PeerConnectionManager(signalingUrl, sessionCode, true, this);
+                connectionManager.start();
 
-            // Block until the current connection attempt ends
-            sessionLatch.await();
+                // Block until the current connection attempt ends
+                sessionLatch.await();
 
-            stopHeartbeat();
-            connectionManager.close();
+                stopHeartbeat();
+                connectionManager.close();
 
-            if (transferCompleted) break;
+                if (transferCompleted) break;
 
-            if (receiverDisconnected) {
-                System.out.println("\nReceiver disconnected. Resetting signaling and waiting for new receiver...");
-                // NOTE: resetSession was already called asynchronously the moment receiver
-                // disconnect was detected (see onConnectionStateChange / onDataChannelStateChange).
-                // We do NOT call it again here to avoid a redundant HTTP round-trip.
-                cListener.onConnecting();
-                // Short pause to let ICE fully tear down before we create a new peer connection
-                Thread.sleep(1_000);
-            } else {
-                // Fatal error for this session
-                break;
+                if (receiverDisconnected) {
+                    System.out.println("\nReceiver disconnected. Resetting signaling and waiting for new receiver...");
+                    // NOTE: resetSession was already called asynchronously the moment receiver
+                    // disconnect was detected (see onConnectionStateChange / onDataChannelStateChange).
+                    // We do NOT call it again here to avoid a redundant HTTP round-trip.
+                    cListener.onConnecting();
+                    // Short pause to let ICE fully tear down before we create a new peer connection
+                    Thread.sleep(1_000);
+                } else {
+                    // Fatal error for this session
+                    break;
+                }
             }
+        } finally {
+            if (heartbeatScheduler != null) {
+                heartbeatScheduler.shutdownNow();
+            }
+            ioExecutor.shutdownNow();
         }
 
-        ioExecutor.shutdownNow();
         if (transferCompleted) {
             tListener.onTransferCompleted();
         } else {
@@ -195,22 +220,39 @@ public class TransferEngine implements WebRtcListener {
 
         cListener.onConnecting();
 
-        connectionManager = new PeerConnectionManager(signalingUrl, sessionCode, false, this);
-        connectionManager.start();
+        // Initialize the scheduler once for the lifetime of this receive operation
+        this.heartbeatScheduler = Executors.newScheduledThreadPool(2, r -> {
+            Thread t = new Thread(r, "wormsink-scheduler");
+            t.setDaemon(true);
+            return t;
+        });
 
-        // FIX 2: Timed await — prevents the receiver hanging forever if ICE gets stuck
-        // in a limbo state (e.g. DISCONNECTED but never FAILED) which never counts down
-        // the latch through the normal onConnectionStateChange path.
-        boolean released = sessionLatch.await(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-        if (!released && sessionError == null) {
-            sessionError = "Connection timed out after " + (CONNECT_TIMEOUT_MS / 1000)
-                    + "s — sender may not be ready yet, please retry";
+        this.connectionLatch = new CountDownLatch(1);
+
+        try {
+            connectionManager = new PeerConnectionManager(signalingUrl, sessionCode, false, this);
+            connectionManager.start();
+
+            // Wait for connection to establish
+            boolean released = connectionLatch.await(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            if (!released && sessionError == null) {
+                sessionError = "Connection timed out after " + (CONNECT_TIMEOUT_MS / 1000)
+                        + "s — sender may not be ready yet, please retry";
+            }
+
+            if (sessionError == null) {
+                // Wait indefinitely for transfer to finish
+                sessionLatch.await();
+            }
+        } finally {
+            cancelIceGraceTimer();
+            stopHeartbeat();
+            if (heartbeatScheduler != null) {
+                heartbeatScheduler.shutdownNow();
+            }
+            connectionManager.close();
+            ioExecutor.shutdownNow();
         }
-
-        cancelIceGraceTimer();
-        stopHeartbeat();
-        connectionManager.close();
-        ioExecutor.shutdownNow();
 
         if (transferCompleted) {
             tListener.onTransferCompleted();
@@ -229,11 +271,12 @@ public class TransferEngine implements WebRtcListener {
 
         boolean isFailed = state.contains("FAILED");
         boolean isClosed = state.contains("CLOSED");
+        boolean isSenderDisconnected = isSender && state.contains("DISCONNECTED");
 
-        if (isFailed || isClosed) {
+        if (isFailed || isClosed || isSenderDisconnected) {
             cancelIceGraceTimer(); // no longer needed if we're definitively done
-            if (isSender && isFailed) {
-                // Receiver died (ICE/connection FAILED). Mark for reconnect and
+            if (isSender && (isFailed || isSenderDisconnected)) {
+                // Receiver died/disconnected. Mark for reconnect and
                 // immediately reset the signaling session so a restarting receiver
                 // cannot pick up our stale offer while the old connection is still
                 // closing (which takes ~3-4 s).  Fire-and-forget — the send() loop
@@ -251,7 +294,7 @@ public class TransferEngine implements WebRtcListener {
             } else {
                 if (sessionError == null) sessionError = state;
             }
-            sessionLatch.countDown();
+            releaseLatches();
 
         } else if (!isSender && state.contains("DISCONNECTED") && !dataChannelEverOpened) {
             // FIX 3: Receiver sees ICE DISCONNECTED before the data channel ever opened.
@@ -271,6 +314,7 @@ public class TransferEngine implements WebRtcListener {
             connectionListener.onConnected();
             if (isSender) {
                 startSenderHeartbeat();
+                startSenderHeartbeatWatch();
                 // Send HELLO + METADATA immediately; hash was pre-computed — no blocking
                 connectionManager.sendMessage(ProtocolSerializer.encodeHello().encode());
                 try {
@@ -282,11 +326,14 @@ public class TransferEngine implements WebRtcListener {
                     connectionManager.sendMessage(ProtocolSerializer.encodeMetadata(json).encode());
                 } catch (Exception e) {
                     sessionError = "Failed to build metadata: " + e.getMessage();
-                    sessionLatch.countDown();
+                    releaseLatches();
                 }
             } else {
                 connectionManager.sendMessage(ProtocolSerializer.encodeHello().encode());
                 startReceiverHeartbeatWatch();
+                if (connectionLatch != null) {
+                    connectionLatch.countDown();
+                }
             }
         } else if (state == RTCDataChannelState.CLOSED) {
             connectionListener.onDisconnected();
@@ -307,7 +354,7 @@ public class TransferEngine implements WebRtcListener {
                 } else if (sessionError == null) {
                     sessionError = "Data channel closed unexpectedly";
                 }
-                sessionLatch.countDown();
+                releaseLatches();
             }
         }
     }
@@ -320,6 +367,7 @@ public class TransferEngine implements WebRtcListener {
     public void onMessageReceived(ByteBuffer data, boolean binary) {
         byte[] snapshot = new byte[data.remaining()];
         data.get(snapshot);
+        lastHeartbeatReceivedMs = System.currentTimeMillis();
 
         ioExecutor.submit(() -> {
             try {
@@ -328,7 +376,7 @@ public class TransferEngine implements WebRtcListener {
                 System.err.println("Exception in ioExecutor: " + e.getMessage());
                 e.printStackTrace(System.err);
                 if (sessionError == null) sessionError = e.getMessage();
-                sessionLatch.countDown();
+                releaseLatches();
             }
         });
     }
@@ -338,42 +386,68 @@ public class TransferEngine implements WebRtcListener {
     // =========================================================================
 
     private void startSenderHeartbeat() {
-        heartbeatScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "wormsink-heartbeat");
-            t.setDaemon(true);
-            return t;
-        });
-        heartbeatScheduler.scheduleAtFixedRate(() -> {
+        senderHeartbeatTask = heartbeatScheduler.scheduleAtFixedRate(() -> {
             if (!transferCompleted && connectionManager.getDataChannelState() == RTCDataChannelState.OPEN) {
                 connectionManager.sendMessage(ProtocolSerializer.encodeHeartbeat().encode());
             }
         }, HEARTBEAT_INTERVAL_MS, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
 
+    private void startSenderHeartbeatWatch() {
+        lastHeartbeatReceivedMs = System.currentTimeMillis();
+        senderWatchdogTask = heartbeatScheduler.scheduleAtFixedRate(() -> {
+            if (transferCompleted) return;
+            long silence = System.currentTimeMillis() - lastHeartbeatReceivedMs;
+            if (silence > HEARTBEAT_TIMEOUT_MS) {
+                System.err.println("\nNo heartbeat/message from receiver for " + (silence / 1000) + "s — receiver died.");
+                receiverDisconnected = true;
+                if (sessionError == null) sessionError = "Receiver heartbeat timeout";
+
+                final String code = sessionCode;
+                final String url  = signalingUrl;
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        new SignalingClient(url).resetSession(code);
+                    } catch (Exception e) {
+                        System.err.println("Warning: early signaling reset (timeout) failed: " + e.getMessage());
+                    }
+                });
+
+                releaseLatches();
+                stopHeartbeat();
+            }
+        }, HEARTBEAT_TIMEOUT_MS, 2_000, TimeUnit.MILLISECONDS);
+    }
+
     private void startReceiverHeartbeatWatch() {
         lastHeartbeatReceivedMs = System.currentTimeMillis();
-        heartbeatScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "wormsink-heartbeat-watch");
-            t.setDaemon(true);
-            return t;
-        });
         // Check every 2 s; timeout after HEARTBEAT_TIMEOUT_MS of silence
-        heartbeatScheduler.scheduleAtFixedRate(() -> {
+        receiverWatchdogTask = heartbeatScheduler.scheduleAtFixedRate(() -> {
             if (transferCompleted) return;
             long silence = System.currentTimeMillis() - lastHeartbeatReceivedMs;
             if (silence > HEARTBEAT_TIMEOUT_MS) {
                 System.err.println("\nNo heartbeat from sender for " + (silence / 1000) + "s — sender died.");
                 if (sessionError == null) sessionError = "Sender heartbeat timeout";
-                sessionLatch.countDown();
+                releaseLatches();
                 stopHeartbeat();
             }
         }, HEARTBEAT_TIMEOUT_MS, 2_000, TimeUnit.MILLISECONDS);
     }
 
     private void stopHeartbeat() {
-        if (heartbeatScheduler != null && !heartbeatScheduler.isShutdown()) {
-            heartbeatScheduler.shutdownNow();
+        if (senderHeartbeatTask != null) {
+            senderHeartbeatTask.cancel(false);
+            senderHeartbeatTask = null;
         }
+        if (senderWatchdogTask != null) {
+            senderWatchdogTask.cancel(false);
+            senderWatchdogTask = null;
+        }
+        if (receiverWatchdogTask != null) {
+            receiverWatchdogTask.cancel(false);
+            receiverWatchdogTask = null;
+        }
+        cancelIceGraceTimer();
     }
 
     // ── ICE DISCONNECTED grace timer helpers ──────────────────────────────────
@@ -385,24 +459,17 @@ public class TransferEngine implements WebRtcListener {
      */
     private void scheduleIceGraceTimer() {
         if (iceDisconnectedTimer != null && !iceDisconnectedTimer.isDone()) return;
-        // Reuse heartbeatScheduler if available; otherwise fall back to a temporary one.
         ScheduledExecutorService exec = heartbeatScheduler;
-        if (exec == null || exec.isShutdown()) {
-            exec = Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "wormsink-ice-grace");
-                t.setDaemon(true);
-                return t;
-            });
+        if (exec != null && !exec.isShutdown()) {
+            iceDisconnectedTimer = exec.schedule(() -> {
+                if (!transferCompleted && sessionError == null) {
+                    System.err.println("\nICE DISCONNECTED grace period expired (" +
+                            (ICE_DISCONNECTED_GRACE_MS / 1000) + "s) — stale session, giving up.");
+                    sessionError = "ICE stuck in DISCONNECTED (stale offer from previous session)";
+                    releaseLatches();
+                }
+            }, ICE_DISCONNECTED_GRACE_MS, TimeUnit.MILLISECONDS);
         }
-        final ScheduledExecutorService finalExec = exec;
-        iceDisconnectedTimer = finalExec.schedule(() -> {
-            if (!transferCompleted && sessionError == null) {
-                System.err.println("\nICE DISCONNECTED grace period expired (" +
-                        (ICE_DISCONNECTED_GRACE_MS / 1000) + "s) — stale session, giving up.");
-                sessionError = "ICE stuck in DISCONNECTED (stale offer from previous session)";
-                sessionLatch.countDown();
-            }
-        }, ICE_DISCONNECTED_GRACE_MS, TimeUnit.MILLISECONDS);
     }
 
     /** Cancels any pending ICE grace timer. Safe to call multiple times. */
@@ -440,6 +507,9 @@ public class TransferEngine implements WebRtcListener {
             case HEARTBEAT:
                 if (!isSender) {
                     lastHeartbeatReceivedMs = System.currentTimeMillis();
+                    connectionManager.sendMessage(ProtocolSerializer.encodeHeartbeat().encode());
+                } else {
+                    lastHeartbeatReceivedMs = System.currentTimeMillis();
                 }
                 break;
 
@@ -462,9 +532,11 @@ public class TransferEngine implements WebRtcListener {
 
                     // Resume or fresh start
                     this.transferState = ResumeEngine.loadState(stateFilePath);
+                    boolean isResume = false;
                     if (this.transferState != null && this.transferState.fileHash.equals(fileHash)) {
                         transferListener.onTransferResumed(
                                 transferState.completedChunks.size() * (long) chunkSize);
+                        isResume = true;
                     } else {
                         this.transferState = new ResumeEngine.TransferState();
                         this.transferState.transferId      = UUID.randomUUID().toString();
@@ -482,7 +554,30 @@ public class TransferEngine implements WebRtcListener {
 
                     transferListener.onTransferStarted(fileName, fileSize, transferState.transferId);
                     bytesTransferred.set(transferState.completedChunks.size() * (long) chunkSize);
-                    requestMoreChunks();
+                    if (transferState.completedChunks.size() == transferState.totalChunks) {
+                        byte[] finalHash = ChunkingEngine.calculateFileSha256(new File(destinationPath));
+                        if (ChunkingEngine.bytesToHex(finalHash).equals(transferState.fileHash)) {
+                            transferCompleted = true;
+                            Files.deleteIfExists(Paths.get(stateFilePath));
+                            connectionManager.sendMessage(ProtocolSerializer.encodeComplete().encode());
+                            releaseLatches();
+                        } else {
+                            sessionError = "Whole-file integrity verification failed";
+                            releaseLatches();
+                        }
+                    } else if (isResume) {
+                        List<Integer> missing = new ArrayList<>();
+                        for (int i = 0; i < transferState.totalChunks; i++) {
+                            if (!transferState.completedChunks.contains(i)) {
+                                missing.add(i);
+                            }
+                        }
+                        int[] missingIndices = missing.stream().mapToInt(Integer::intValue).toArray();
+                        connectionManager.sendMessage(ProtocolSerializer.encodeResume(
+                                transferState.transferId, transferState.fileHash, missingIndices).encode());
+                    } else {
+                        requestMoreChunks();
+                    }
                 }
                 break;
 
@@ -529,10 +624,10 @@ public class TransferEngine implements WebRtcListener {
                             transferCompleted = true;
                             Files.deleteIfExists(Paths.get(stateFilePath));
                             connectionManager.sendMessage(ProtocolSerializer.encodeComplete().encode());
-                            sessionLatch.countDown();
+                            releaseLatches();
                         } else {
                             sessionError = "Whole-file integrity verification failed";
-                            sessionLatch.countDown();
+                            releaseLatches();
                         }
                     } else {
                         requestMoreChunks();
@@ -553,18 +648,22 @@ public class TransferEngine implements WebRtcListener {
             case COMPLETE:
                 if (isSender) {
                     transferCompleted = true;
-                    sessionLatch.countDown();
+                    releaseLatches();
                 }
                 break;
 
             case ERROR:
                 sessionError = ProtocolSerializer.decodeError(frame.payload);
-                sessionLatch.countDown();
+                releaseLatches();
                 break;
 
             case RESUME:
                 if (isSender) {
                     ProtocolSerializer.ResumeData resume = ProtocolSerializer.decodeResume(frame.payload);
+                    int totalChunks = (int) Math.ceil((double) file.length() / chunkSize);
+                    int completedCount = totalChunks - resume.missingChunkIndices.length;
+                    bytesTransferred.set(completedCount * (long) chunkSize);
+                    reportProgress();
                     sendChunksAsync(resume.missingChunkIndices);
                 }
                 break;
@@ -642,7 +741,7 @@ public class TransferEngine implements WebRtcListener {
                                     e.getMessage() != null ? e.getMessage() : "chunk send error").encode());
                 } catch (Exception ignored) {}
                 if (sessionError == null) sessionError = e.getMessage();
-                sessionLatch.countDown();
+                releaseLatches();
             }
         });
     }

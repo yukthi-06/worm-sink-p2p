@@ -11,14 +11,16 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class SignalingClient {
+    private static final HttpClient SHARED_CLIENT = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(10))
+            .build();
+
     private final String baseUrl;
     private final HttpClient client;
 
     public SignalingClient(String baseUrl) {
         this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
-        this.client = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(10))
-                .build();
+        this.client = SHARED_CLIENT;
     }
 
     public String createSession() throws Exception {
