@@ -58,11 +58,11 @@ public class WormSinkCli {
 
     private static void handleSend(String filePath, String signalingUrl, int parallel) throws Exception {
         File file = new File(filePath);
-        if (!file.exists() || !file.isFile()) {
-            throw new IllegalArgumentException("File does not exist or is not a file: " + filePath);
+        if (!file.exists()) {
+            throw new IllegalArgumentException("Path does not exist: " + filePath);
         }
 
-        System.out.println("Preparing file...");
+        System.out.println("Preparing " + (file.isDirectory() ? "folder" : "file") + "...");
         System.out.println("Generating metadata...");
 
         // Generate transfer code
@@ -80,7 +80,7 @@ public class WormSinkCli {
                 // Progress Listener
                 (transferred, total, rate, eta) -> {
                     System.out.print(String.format("\rSent: %s / %s | Rate: %s/s | ETA: %s          ",
-                            formatSize(transferred), formatSize(total), formatSize((long) rate), formatDuration(eta)));
+                             formatSize(transferred), formatSize(total), formatSize((long) rate), formatDuration(eta)));
                 },
                 // Connection Listener
                 new ConnectionListener() {
@@ -109,19 +109,15 @@ public class WormSinkCli {
                     @Override
                     public void onTransferCompleted() {
                         System.out.println("\nTransfer completed successfully!");
-                        java.util.concurrent.CompletableFuture.runAsync(() -> {
-                            try { Thread.sleep(200); } catch (Exception ignored) {}
-                            Runtime.getRuntime().halt(0);
-                        });
+                        System.out.flush();
+                        Runtime.getRuntime().halt(0);
                     }
 
                     @Override
                     public void onTransferFailed(String reason) {
                         System.out.println("\nTransfer failed: " + reason);
-                        java.util.concurrent.CompletableFuture.runAsync(() -> {
-                            try { Thread.sleep(200); } catch (Exception ignored) {}
-                            Runtime.getRuntime().halt(1);
-                        });
+                        System.out.flush();
+                        Runtime.getRuntime().halt(1);
                     }
 
                     @Override

@@ -47,6 +47,8 @@ public class TransferEngine implements WebRtcListener {
 
     private boolean isSender;
     private File file;
+    private boolean isDirectory;
+    private VirtualFileMapper virtualFileMapper;
     private String signalingUrl;
     private String sessionCode;
     private String destinationPath;
@@ -139,17 +141,31 @@ public class TransferEngine implements WebRtcListener {
                      TransferListener tListener) throws Exception {
         this.isSender      = true;
         this.file          = file;
+        this.isDirectory   = file.isDirectory();
         this.signalingUrl  = signalingUrl;
         this.sessionCode   = sessionCode;
         this.progressListener   = pListener;
         this.connectionListener = cListener;
         this.transferListener   = tListener;
 
-        tListener.onTransferStarted(file.getName(), file.length(), sessionCode);
-        cListener.onConnecting();
-
-        // Pre-compute hash once (heavy; must not run on a native WebRTC callback thread).
-        this.precomputedFileHash = ChunkingEngine.bytesToHex(ChunkingEngine.calculateFileSha256(file));
+        if (isDirectory) {
+            List<VirtualFileMapper.FileEntry> entries = VirtualFileMapper.buildFromDirectory(file);
+            this.virtualFileMapper = new VirtualFileMapper(entries);
+            List<File> files = new ArrayList<>();
+            collectFilesRecursive(file, files);
+            files.sort((f1, f2) -> {
+                String r1 = VirtualFileMapper.getRelativePath(file, f1);
+                String r2 = VirtualFileMapper.getRelativePath(file, f2);
+                return r1.compareTo(r2);
+            });
+            tListener.onTransferStarted(file.getName(), virtualFileMapper.getTotalSize(), sessionCode);
+            cListener.onConnecting();
+            this.precomputedFileHash = ChunkingEngine.bytesToHex(ChunkingEngine.calculateFolderSha256(files));
+        } else {
+            tListener.onTransferStarted(file.getName(), file.length(), sessionCode);
+            cListener.onConnecting();
+            this.precomputedFileHash = ChunkingEngine.bytesToHex(ChunkingEngine.calculateFileSha256(file));
+        }
 
         // Initialize the scheduler once for the lifetime of this send operation
         this.heartbeatScheduler = Executors.newScheduledThreadPool(2, r -> {
@@ -322,11 +338,38 @@ public class TransferEngine implements WebRtcListener {
                 // Send HELLO + METADATA immediately; hash was pre-computed — no blocking
                 connectionManager.sendMessage(ProtocolSerializer.encodeHello().encode());
                 try {
-                    String json = String.format(
-                            "{\"fileName\":\"%s\",\"fileSize\":%d,\"chunkSize\":%d,\"totalChunks\":%d,\"fileHash\":\"%s\"}",
-                            file.getName(), file.length(), chunkSize,
-                            (int) Math.ceil((double) file.length() / chunkSize),
-                            precomputedFileHash);
+                    String json;
+                    if (isDirectory) {
+                        StringBuilder sb = new StringBuilder();
+                        sb.append("{");
+                        sb.append("\"fileName\":\"").append(SimpleJson.escape(file.getName())).append("\",");
+                        sb.append("\"fileSize\":").append(virtualFileMapper.getTotalSize()).append(",");
+                        sb.append("\"chunkSize\":").append(chunkSize).append(",");
+                        sb.append("\"totalChunks\":").append((int) Math.ceil((double) virtualFileMapper.getTotalSize() / chunkSize)).append(",");
+                        sb.append("\"fileHash\":\"").append(precomputedFileHash).append("\",");
+                        sb.append("\"isDirectory\":true,");
+                        sb.append("\"manifest\":[");
+                        List<VirtualFileMapper.FileEntry> entries = virtualFileMapper.getEntries();
+                        for (int i = 0; i < entries.size(); i++) {
+                            VirtualFileMapper.FileEntry entry = entries.get(i);
+                            sb.append("{");
+                            sb.append("\"relPath\":\"").append(SimpleJson.escape(entry.relPath)).append("\",");
+                            sb.append("\"size\":").append(entry.size);
+                            sb.append("}");
+                            if (i < entries.size() - 1) {
+                                sb.append(",");
+                            }
+                        }
+                        sb.append("]");
+                        sb.append("}");
+                        json = sb.toString();
+                    } else {
+                        json = String.format(
+                                "{\"fileName\":\"%s\",\"fileSize\":%d,\"chunkSize\":%d,\"totalChunks\":%d,\"fileHash\":\"%s\"}",
+                                file.getName(), file.length(), chunkSize,
+                                (int) Math.ceil((double) file.length() / chunkSize),
+                                precomputedFileHash);
+                    }
                     connectionManager.sendMessage(ProtocolSerializer.encodeMetadata(json).encode());
                 } catch (Exception e) {
                     sessionError = "Failed to build metadata: " + e.getMessage();
@@ -525,27 +568,76 @@ public class TransferEngine implements WebRtcListener {
                     long   fileSize  = Long.parseLong(SimpleJson.getField(json, "fileSize"));
                     int totalChunks  = Integer.parseInt(SimpleJson.getField(json, "totalChunks"));
                     this.chunkSize   = Integer.parseInt(SimpleJson.getField(json, "chunkSize"));
+                    String isDirStr  = SimpleJson.getField(json, "isDirectory");
+                    this.isDirectory = "true".equalsIgnoreCase(isDirStr);
 
-                    // Resolve directory → actual filename
-                    File destFile = new File(destinationPath);
-                    if (destFile.isDirectory()) {
-                        destFile = new File(destFile, fileName);
-                        this.destinationPath = destFile.getPath();
+                    if (isDirectory) {
+                        List<String> manifestList = SimpleJson.getArray(json, "manifest");
+                        List<VirtualFileMapper.FileEntry> entries = new ArrayList<>();
+                        long currentVirtualOffset = 0;
+                        for (String item : manifestList) {
+                            String relPath = SimpleJson.getField(item, "relPath");
+                            long size = Long.parseLong(SimpleJson.getField(item, "size"));
+                            entries.add(new VirtualFileMapper.FileEntry(relPath, size, currentVirtualOffset));
+                            currentVirtualOffset += size;
+                        }
+                        this.virtualFileMapper = new VirtualFileMapper(entries);
+
+                        File destFile = new File(destinationPath);
+                        if (!destFile.exists()) {
+                            destFile.mkdirs();
+                        }
+                        File sharedFolder = new File(destFile, fileName);
+                        if (!sharedFolder.exists()) {
+                            sharedFolder.mkdirs();
+                        }
+                        this.destinationPath = sharedFolder.getPath();
                         this.stateFilePath   = this.destinationPath + ".state";
+                    } else {
+                        File destFile = new File(destinationPath);
+                        if (destFile.isDirectory()) {
+                            destFile = new File(destFile, fileName);
+                            this.destinationPath = destFile.getPath();
+                            this.stateFilePath   = this.destinationPath + ".state";
+                        }
                     }
 
-                    // If file already exists and matches expected size and hash, complete immediately
-                    File checkFile = new File(destinationPath);
-                    if (checkFile.exists() && checkFile.isFile() && checkFile.length() == fileSize) {
-                        byte[] existingHash = ChunkingEngine.calculateFileSha256(checkFile);
-                        if (ChunkingEngine.bytesToHex(existingHash).equals(fileHash)) {
-                            transferListener.onTransferStarted(fileName, fileSize, UUID.randomUUID().toString());
-                            bytesTransferred.set(fileSize);
-                            transferCompleted = true;
-                            Files.deleteIfExists(Paths.get(stateFilePath));
-                            connectionManager.sendMessage(ProtocolSerializer.encodeComplete().encode());
-                            releaseLatches();
-                            break;
+                    if (isDirectory) {
+                        File checkDir = new File(destinationPath);
+                        if (checkDir.exists() && checkDir.isDirectory()) {
+                            List<File> files = new ArrayList<>();
+                            collectFilesRecursive(checkDir, files);
+                            files.sort((f1, f2) -> {
+                                String r1 = VirtualFileMapper.getRelativePath(checkDir, f1);
+                                String r2 = VirtualFileMapper.getRelativePath(checkDir, f2);
+                                return r1.compareTo(r2);
+                            });
+                            if (!files.isEmpty()) {
+                                byte[] existingHash = ChunkingEngine.calculateFolderSha256(files);
+                                if (ChunkingEngine.bytesToHex(existingHash).equals(fileHash)) {
+                                    transferListener.onTransferStarted(fileName, fileSize, UUID.randomUUID().toString());
+                                    bytesTransferred.set(fileSize);
+                                    transferCompleted = true;
+                                    Files.deleteIfExists(Paths.get(stateFilePath));
+                                    connectionManager.sendMessage(ProtocolSerializer.encodeComplete().encode());
+                                    releaseLatches();
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        File checkFile = new File(destinationPath);
+                        if (checkFile.exists() && checkFile.isFile() && checkFile.length() == fileSize) {
+                            byte[] existingHash = ChunkingEngine.calculateFileSha256(checkFile);
+                            if (ChunkingEngine.bytesToHex(existingHash).equals(fileHash)) {
+                                transferListener.onTransferStarted(fileName, fileSize, UUID.randomUUID().toString());
+                                bytesTransferred.set(fileSize);
+                                transferCompleted = true;
+                                Files.deleteIfExists(Paths.get(stateFilePath));
+                                connectionManager.sendMessage(ProtocolSerializer.encodeComplete().encode());
+                                releaseLatches();
+                                break;
+                            }
                         }
                     }
 
@@ -565,8 +657,12 @@ public class TransferEngine implements WebRtcListener {
                         this.transferState.totalChunks     = totalChunks;
                         this.transferState.destinationPath = destinationPath;
 
-                        try (RandomAccessFile raf = new RandomAccessFile(destinationPath, "rw")) {
-                            raf.setLength(fileSize);
+                        if (isDirectory) {
+                            VirtualFileMapper.preallocateFiles(new File(destinationPath), virtualFileMapper);
+                        } else {
+                            try (RandomAccessFile raf = new RandomAccessFile(destinationPath, "rw")) {
+                                raf.setLength(fileSize);
+                            }
                         }
                         ResumeEngine.saveState(transferState, stateFilePath);
                     }
@@ -624,9 +720,13 @@ public class TransferEngine implements WebRtcListener {
                     }
 
                     // Write to disk
-                    try (RandomAccessFile raf = new RandomAccessFile(destinationPath, "rw");
-                         FileChannel channel = raf.getChannel()) {
-                        channel.write(ByteBuffer.wrap(chunk.data), chunk.offset);
+                    if (isDirectory) {
+                        VirtualFileMapper.writeVirtualBytes(new File(destinationPath), virtualFileMapper, chunk.offset, chunk.data);
+                    } else {
+                        try (RandomAccessFile raf = new RandomAccessFile(destinationPath, "rw");
+                             FileChannel channel = raf.getChannel()) {
+                            channel.write(ByteBuffer.wrap(chunk.data), chunk.offset);
+                        }
                     }
 
                     transferState.completedChunks.add(chunk.chunkIndex);
@@ -638,7 +738,20 @@ public class TransferEngine implements WebRtcListener {
                             ProtocolSerializer.encodeAck(chunk.chunkIndex, (byte) 0).encode());
 
                     if (transferState.completedChunks.size() == transferState.totalChunks) {
-                        byte[] finalHash = ChunkingEngine.calculateFileSha256(new File(destinationPath));
+                        byte[] finalHash;
+                        if (isDirectory) {
+                            List<File> files = new ArrayList<>();
+                            collectFilesRecursive(new File(destinationPath), files);
+                            files.sort((f1, f2) -> {
+                                String r1 = VirtualFileMapper.getRelativePath(new File(destinationPath), f1);
+                                String r2 = VirtualFileMapper.getRelativePath(new File(destinationPath), f2);
+                                return r1.compareTo(r2);
+                            });
+                            finalHash = ChunkingEngine.calculateFolderSha256(files);
+                        } else {
+                            finalHash = ChunkingEngine.calculateFileSha256(new File(destinationPath));
+                        }
+                        
                         if (ChunkingEngine.bytesToHex(finalHash).equals(transferState.fileHash)) {
                             transferCompleted = true;
                             Files.deleteIfExists(Paths.get(stateFilePath));
@@ -715,21 +828,29 @@ public class TransferEngine implements WebRtcListener {
 
     private void sendChunksAsync(int[] indices) {
         CompletableFuture.runAsync(() -> {
-            try (RandomAccessFile raf = new RandomAccessFile(file, "r");
-                 FileChannel channel = raf.getChannel()) {
-                // Track when we last injected an inline heartbeat so that the receiver
-                // never goes silent for > HEARTBEAT_INTERVAL_MS even while we are
-                // saturating the DataChannel with chunk data.
+            RandomAccessFile raf = null;
+            FileChannel channel = null;
+            try {
+                if (!isDirectory) {
+                    raf = new RandomAccessFile(file, "r");
+                    channel = raf.getChannel();
+                }
                 long lastInlineHeartbeatMs = System.currentTimeMillis();
 
                 for (int index : indices) {
                     long offset = (long) index * chunkSize;
-                    long size   = Math.min(chunkSize, file.length() - offset);
+                    long totalSize = isDirectory ? virtualFileMapper.getTotalSize() : file.length();
+                    long size   = Math.min(chunkSize, totalSize - offset);
                     if (size <= 0) continue;
 
-                    ByteBuffer buffer = ByteBuffer.allocate((int) size);
-                    channel.read(buffer, offset);
-                    byte[] chunkData = buffer.array();
+                    byte[] chunkData;
+                    if (isDirectory) {
+                        chunkData = VirtualFileMapper.readVirtualBytes(file, virtualFileMapper, offset, (int) size);
+                    } else {
+                        ByteBuffer buffer = ByteBuffer.allocate((int) size);
+                        channel.read(buffer, offset);
+                        chunkData = buffer.array();
+                    }
                     byte[] sha256    = ChunkingEngine.calculateSha256(chunkData);
 
                     // Back-pressure: wait if the DataChannel send buffer is getting full
@@ -761,6 +882,13 @@ public class TransferEngine implements WebRtcListener {
                 } catch (Exception ignored) {}
                 if (sessionError == null) sessionError = e.getMessage();
                 releaseLatches();
+            } finally {
+                if (channel != null) {
+                    try { channel.close(); } catch (Exception ignored) {}
+                }
+                if (raf != null) {
+                    try { raf.close(); } catch (Exception ignored) {}
+                }
             }
         });
     }
@@ -773,7 +901,7 @@ public class TransferEngine implements WebRtcListener {
         long now     = System.currentTimeMillis();
         long elapsed = now - lastTime;
         if (elapsed >= 1000) {
-            long total   = isSender ? file.length() : transferState.fileSize;
+            long total   = isSender ? (isDirectory ? virtualFileMapper.getTotalSize() : file.length()) : transferState.fileSize;
             long current = bytesTransferred.get();
             long diff    = current - lastBytes;
             double rate  = (double) diff / (elapsed / 1000.0);
@@ -783,6 +911,18 @@ public class TransferEngine implements WebRtcListener {
 
             lastTime  = now;
             lastBytes = current;
+        }
+    }
+
+    private void collectFilesRecursive(File dir, List<File> files) {
+        File[] children = dir.listFiles();
+        if (children == null) return;
+        for (File child : children) {
+            if (child.isDirectory()) {
+                collectFilesRecursive(child, files);
+            } else if (child.isFile()) {
+                files.add(child);
+            }
         }
     }
 }

@@ -32,6 +32,22 @@ public class ChunkingEngine {
         return md.digest();
     }
 
+    public static byte[] calculateFolderSha256(List<File> files) throws Exception {
+        MessageDigest md = MessageDigest.getInstance("SHA-256");
+        ByteBuffer buffer = ByteBuffer.allocate(64 * 1024);
+        for (File file : files) {
+            try (RandomAccessFile raf = new RandomAccessFile(file, "r");
+                 FileChannel channel = raf.getChannel()) {
+                while (channel.read(buffer) > 0) {
+                    buffer.flip();
+                    md.update(buffer);
+                    buffer.clear();
+                }
+            }
+        }
+        return md.digest();
+    }
+
     public static String bytesToHex(byte[] bytes) {
         StringBuilder sb = new StringBuilder();
         for (byte b : bytes) {
