@@ -49,6 +49,27 @@ public class PeerConnectionManager implements PeerConnectionObserver {
     }
 
     public void start() throws Exception {
+        // Redirect WebRTC native logs to SLF4J
+        try {
+            org.slf4j.Logger webrtcLogger = org.slf4j.LoggerFactory.getLogger("dev.onvoid.webrtc.native");
+            dev.onvoid.webrtc.logging.Logging.addLogSink(dev.onvoid.webrtc.logging.Logging.Severity.INFO, (severity, message) -> {
+                switch (severity) {
+                    case VERBOSE:
+                        webrtcLogger.trace(message);
+                        break;
+                    case INFO:
+                        webrtcLogger.info(message);
+                        break;
+                    case WARNING:
+                        webrtcLogger.warn(message);
+                        break;
+                    case ERROR:
+                        webrtcLogger.error(message);
+                        break;
+                }
+            });
+        } catch (Throwable ignored) {}
+
         // Initialize Native WebRTC library with dummy audio
         this.audioDeviceModule = new AudioDeviceModule(AudioLayer.kDummyAudio);
         this.factory = new PeerConnectionFactory(this.audioDeviceModule);

@@ -174,7 +174,9 @@ public class TransferEngine implements WebRtcListener {
                 sessionLatch.await();
 
                 stopHeartbeat();
-                connectionManager.close();
+                if (!transferCompleted) {
+                    connectionManager.close();
+                }
 
                 if (transferCompleted) break;
 
@@ -250,7 +252,9 @@ public class TransferEngine implements WebRtcListener {
             if (heartbeatScheduler != null) {
                 heartbeatScheduler.shutdownNow();
             }
-            connectionManager.close();
+            if (!transferCompleted) {
+                connectionManager.close();
+            }
             ioExecutor.shutdownNow();
         }
 
@@ -528,6 +532,21 @@ public class TransferEngine implements WebRtcListener {
                         destFile = new File(destFile, fileName);
                         this.destinationPath = destFile.getPath();
                         this.stateFilePath   = this.destinationPath + ".state";
+                    }
+
+                    // If file already exists and matches expected size and hash, complete immediately
+                    File checkFile = new File(destinationPath);
+                    if (checkFile.exists() && checkFile.isFile() && checkFile.length() == fileSize) {
+                        byte[] existingHash = ChunkingEngine.calculateFileSha256(checkFile);
+                        if (ChunkingEngine.bytesToHex(existingHash).equals(fileHash)) {
+                            transferListener.onTransferStarted(fileName, fileSize, UUID.randomUUID().toString());
+                            bytesTransferred.set(fileSize);
+                            transferCompleted = true;
+                            Files.deleteIfExists(Paths.get(stateFilePath));
+                            connectionManager.sendMessage(ProtocolSerializer.encodeComplete().encode());
+                            releaseLatches();
+                            break;
+                        }
                     }
 
                     // Resume or fresh start

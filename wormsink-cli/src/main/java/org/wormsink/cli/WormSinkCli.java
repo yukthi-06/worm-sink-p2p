@@ -11,6 +11,10 @@ public class WormSinkCli {
     private static final String DEFAULT_SIGNALING_URL = "https://wormsinks.shibupc.workers.dev";
 
     public static void main(String[] args) {
+        // Route java.util.logging to SLF4J
+        org.slf4j.bridge.SLF4JBridgeHandler.removeHandlersForRootLogger();
+        org.slf4j.bridge.SLF4JBridgeHandler.install();
+
         if (args.length < 2) {
             printUsage();
             System.exit(1);
@@ -44,7 +48,7 @@ public class WormSinkCli {
                 printUsage();
                 System.exit(1);
             }
-            System.exit(0);
+            Runtime.getRuntime().halt(0);
         } catch (Exception e) {
             System.err.println("\nError: " + e.getMessage());
             e.printStackTrace();
@@ -105,13 +109,19 @@ public class WormSinkCli {
                     @Override
                     public void onTransferCompleted() {
                         System.out.println("\nTransfer completed successfully!");
-                        System.exit(0);
+                        java.util.concurrent.CompletableFuture.runAsync(() -> {
+                            try { Thread.sleep(200); } catch (Exception ignored) {}
+                            Runtime.getRuntime().halt(0);
+                        });
                     }
 
                     @Override
                     public void onTransferFailed(String reason) {
                         System.out.println("\nTransfer failed: " + reason);
-                        System.exit(1);
+                        java.util.concurrent.CompletableFuture.runAsync(() -> {
+                            try { Thread.sleep(200); } catch (Exception ignored) {}
+                            Runtime.getRuntime().halt(1);
+                        });
                     }
 
                     @Override
@@ -175,13 +185,15 @@ public class WormSinkCli {
                     @Override
                     public void onTransferCompleted() {
                         System.out.println("\nDownload completed successfully!");
-                        System.exit(0);
+                        System.out.flush();
+                        Runtime.getRuntime().halt(0);
                     }
 
                     @Override
                     public void onTransferFailed(String reason) {
                         System.out.println("\nDownload failed: " + reason);
-                        System.exit(1);
+                        System.out.flush();
+                        Runtime.getRuntime().halt(1);
                     }
 
                     @Override
